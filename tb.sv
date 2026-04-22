@@ -1,206 +1,115 @@
-// ---------------------------------------------------------------------------
-// UART Receiver (SystemVerilog)
-// ---------------------------------------------------------------------------
-module uart_rx #(
-    parameter int CLKS_PER_BIT = 87
-) (
-    input  logic       i_Clock,
-    input  logic       i_Rx_Serial,
-    output logic       o_Rx_DV,
-    output logic [7:0] o_Rx_Byte
-);
+`timescale 1ns/10ps
 
-    // SV Strongly Typed Enum for State Machine
-    typedef enum logic [2:0] {
-        IDLE,
-        RX_START,
-        RX_DATA,
-        RX_STOP,
-        CLEANUP
-    } state_t;
+module tb_uart;
 
-    state_t r_SM_Main = IDLE;
+    localparam int CLK_PERIOD_NS = 100;
+    localparam int CLKS_PER_BIT  = 87;
 
-    logic       r_Rx_Data_R = 1'b1;
-    logic       r_Rx_Data   = 1'b1;
-    int         r_Clock_Count = 0;
-    logic [2:0] r_Bit_Index   = 0; 
-    logic [7:0] r_Rx_Byte     = 0;
-    logic       r_Rx_DV       = 0;
+    // TB Signals using SV logic type instead of reg/wire
+    logic       clk = 0;
+    logic       tx_dv = 0;
+    logic [7:0] tx_byte = 0;
+    logic       tx_active;
+    logic       tx_serial;
+    logic       tx_done;
 
-    // 2-Stage Synchronizer to prevent metastability
-    always_ff @(posedge i_Clock) begin
-        r_Rx_Data_R <= i_Rx_Serial;
-        r_Rx_Data   <= r_Rx_Data_R;
+    logic       rx_dv;
+    logic [7:0] rx_byte;
+
+    // Clock generation
+    always #(CLK_PERIOD_NS/2) clk = ~clk;
+
+    // Instantiate your original Verilog TX module
+    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) dut_tx (
+        .i_Clock(clk),
+        .i_Tx_DV(tx_dv),
+        .i_Tx_Byte(tx_byte),
+        .o_Tx_Active(tx_active),
+        .o_Tx_Serial(tx_serial),
+        .o_Tx_Done(tx_done)
+    );
+
+    // Instantiate your original Verilog RX module
+    // LOOPBACK CONFIGURATION: tx_serial is routed directly into i_Rx_Serial
+    uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) dut_rx (
+        .i_Clock(clk),
+        .i_Rx_Serial(tx_serial), 
+        .o_Rx_DV(rx_dv),
+        .o_Rx_Byte(rx_byte)
+    );
+
+    // SV Scoreboard: A dynamic queue to hold expected data
+    logic [7:0] expected_data[$];
+
+    // Main Test Sequence (Stimulus Generator)
+    initial begin
+        logic [7:0] rand_data;
+        
+        $display("----------------------------------------");
+        $display("Starting SV Verification of Original RTL");
+        $display("----------------------------------------");
+
+        // Wait for system to stabilize
+        repeat(5) @(posedge clk);
+
+        // Generate and send 10 randomized bytes
+        for (int i = 0; i < 10; i++) begin
+            rand_data = $urandom_range(0, 255);
+            
+            // Push expected data to the back of the scoreboard queue
+            expected_data.push_back(rand_data); 
+
+            // Drive the TX module
+            @(posedge clk);
+            tx_dv   <= 1'b1;
+            tx_byte <= rand_data;
+            
+            @(posedge clk);
+            tx_dv   <= 1'b0;
+
+            $display("[%0t] DRIVER: Sent Byte 0x%0h", $time, rand_data);
+
+            // Wait for the TX module to assert done
+            @(posedge tx_done);
+            
+            // Allow a brief gap between transmissions
+            repeat(10) @(posedge clk); 
+        end
     end
 
-    // RX State Machine
-    always_ff @(posedge i_Clock) begin
-        case (r_SM_Main)
-            IDLE: begin
-                r_Rx_DV       <= 1'b0;
-                r_Clock_Count <= 0;
-                r_Bit_Index   <= 0;
+    // Monitor and Checker (Self-Checking Logic)
+    always_ff @(posedge clk) begin
+        // Whenever RX says data is valid, check it against the scoreboard
+        if (rx_dv) begin
+            logic [7:0] exp_byte;
+            
+            if (expected_data.size() == 0) begin
+                $error("[%0t] SCOREBOARD FAIL: Unexpected data received (0x%0h)", $time, rx_byte);
+            end else begin
+                // Pop the oldest expected data from the front of the queue
+                exp_byte = expected_data.pop_front();
                 
-                if (r_Rx_Data == 1'b0) r_SM_Main <= RX_START;
-                else                   r_SM_Main <= IDLE;
-            end
-            
-            RX_START: begin
-                if (r_Clock_Count == (CLKS_PER_BIT-1)/2) begin
-                    if (r_Rx_Data == 1'b0) begin
-                        r_Clock_Count <= 0; 
-                        r_SM_Main     <= RX_DATA;
-                    end else begin
-                        r_SM_Main <= IDLE;
-                    end
+                if (rx_byte === exp_byte) begin
+                    $display("[%0t] SCOREBOARD PASS: Expected 0x%0h, Received 0x%0h", $time, exp_byte, rx_byte);
                 end else begin
-                    r_Clock_Count <= r_Clock_Count + 1;
-                    r_SM_Main     <= RX_START;
+                    $error("[%0t] SCOREBOARD FAIL: Expected 0x%0h, Got 0x%0h", $time, exp_byte, rx_byte);
                 end
             end
             
-            RX_DATA: begin
-                if (r_Clock_Count < CLKS_PER_BIT-1) begin
-                    r_Clock_Count <= r_Clock_Count + 1;
-                    r_SM_Main     <= RX_DATA;
-                end else begin
-                    r_Clock_Count          <= 0;
-                    r_Rx_Byte[r_Bit_Index] <= r_Rx_Data;
-                    
-                    if (r_Bit_Index < 7) begin
-                        r_Bit_Index <= r_Bit_Index + 1;
-                        r_SM_Main   <= RX_DATA;
-                    end else begin
-                        r_Bit_Index <= 0;
-                        r_SM_Main   <= RX_STOP;
-                    end
-                end
+            // End simulation gracefully when all expected data is verified
+            if (expected_data.size() == 0) begin
+                $display("----------------------------------------");
+                $display("Verification Complete: All Bytes Matched");
+                $display("----------------------------------------");
+                $finish;
             end
-            
-            RX_STOP: begin
-                if (r_Clock_Count < CLKS_PER_BIT-1) begin
-                    r_Clock_Count <= r_Clock_Count + 1;
-                    r_SM_Main     <= RX_STOP;
-                end else begin
-                    r_Rx_DV       <= 1'b1;
-                    r_Clock_Count <= 0;
-                    r_SM_Main     <= CLEANUP;
-                end
-            end
-            
-            CLEANUP: begin
-                r_SM_Main <= IDLE;
-                r_Rx_DV   <= 1'b0;
-            end
-            
-            default: r_SM_Main <= IDLE;
-        endcase
+        end
     end
 
-    assign o_Rx_DV   = r_Rx_DV;
-    assign o_Rx_Byte = r_Rx_Byte;
-
-endmodule
-
-// ---------------------------------------------------------------------------
-// UART Transmitter (SystemVerilog)
-// ---------------------------------------------------------------------------
-module uart_tx #(
-    parameter int CLKS_PER_BIT = 87
-) (
-    input  logic       i_Clock,
-    input  logic       i_Tx_DV,
-    input  logic [7:0] i_Tx_Byte, 
-    output logic       o_Tx_Active,
-    output logic       o_Tx_Serial,
-    output logic       o_Tx_Done
-);
-
-    typedef enum logic [2:0] {
-        IDLE,
-        TX_START,
-        TX_DATA,
-        TX_STOP,
-        CLEANUP
-    } state_t;
-
-    state_t r_SM_Main = IDLE;
-
-    int         r_Clock_Count = 0;
-    logic [2:0] r_Bit_Index   = 0;
-    logic [7:0] r_Tx_Data     = 0;
-    logic       r_Tx_Done     = 0;
-    logic       r_Tx_Active   = 0;
-
-    always_ff @(posedge i_Clock) begin
-        case (r_SM_Main)
-            IDLE: begin
-                o_Tx_Serial   <= 1'b1;
-                r_Tx_Done     <= 1'b0;
-                r_Clock_Count <= 0;
-                r_Bit_Index   <= 0;
-                
-                if (i_Tx_DV == 1'b1) begin
-                    r_Tx_Active <= 1'b1;
-                    r_Tx_Data   <= i_Tx_Byte;
-                    r_SM_Main   <= TX_START;
-                end else begin
-                    r_SM_Main <= IDLE;
-                end
-            end
-            
-            TX_START: begin
-                o_Tx_Serial <= 1'b0;
-                if (r_Clock_Count < CLKS_PER_BIT-1) begin
-                    r_Clock_Count <= r_Clock_Count + 1;
-                    r_SM_Main     <= TX_START;
-                end else begin
-                    r_Clock_Count <= 0;
-                    r_SM_Main     <= TX_DATA;
-                end
-            end
-            
-            TX_DATA: begin
-                o_Tx_Serial <= r_Tx_Data[r_Bit_Index];
-                if (r_Clock_Count < CLKS_PER_BIT-1) begin
-                    r_Clock_Count <= r_Clock_Count + 1;
-                    r_SM_Main     <= TX_DATA;
-                end else begin
-                    r_Clock_Count <= 0;
-                    if (r_Bit_Index < 7) begin
-                        r_Bit_Index <= r_Bit_Index + 1;
-                        r_SM_Main   <= TX_DATA;
-                    end else begin
-                        r_Bit_Index <= 0;
-                        r_SM_Main   <= TX_STOP;
-                    end
-                end
-            end
-            
-            TX_STOP: begin
-                o_Tx_Serial <= 1'b1;
-                if (r_Clock_Count < CLKS_PER_BIT-1) begin
-                    r_Clock_Count <= r_Clock_Count + 1;
-                    r_SM_Main     <= TX_STOP;
-                end else begin
-                    r_Tx_Done     <= 1'b1;
-                    r_Clock_Count <= 0;
-                    r_SM_Main     <= CLEANUP;
-                    r_Tx_Active   <= 1'b0;
-                end
-            end
-            
-            CLEANUP: begin
-                r_Tx_Done <= 1'b1;
-                r_SM_Main <= IDLE;
-            end
-            
-            default: r_SM_Main <= IDLE;
-        endcase
+    // VCD Dump for waveform analysis
+    initial begin
+        $dumpfile("uart_waves.vcd");
+        $dumpvars(0, tb_uart);
     end
-
-    assign o_Tx_Active = r_Tx_Active;
-    assign o_Tx_Done   = r_Tx_Done;
 
 endmodule
